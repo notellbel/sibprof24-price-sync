@@ -33,22 +33,16 @@ import requests
 import xml.etree.ElementTree as ET
 
 # ========== НАСТРОЙКИ — ЗАПОЛНИТЕ ПЕРЕД ЗАПУСКОМ ==========
-import os
-
-SITE_URL = os.environ.get("WC_SITE_URL", "https://sibprof24.ru")
-CONSUMER_KEY = os.environ.get("WC_CONSUMER_KEY", "ck_ВСТАВЬТЕ_СЮДА")
-CONSUMER_SECRET = os.environ.get("WC_CONSUMER_SECRET", "cs_ВСТАВЬТЕ_СЮДА")
-# ^ если запускаете локально на своём компьютере - можно просто вписать
-#   ключи в кавычки выше вместо переменных окружения, тогда эта строка
-#   их и подхватит. Если запускаете через GitHub Actions - ключи придут
-#   из GitHub Secrets автоматически, ничего в этом файле менять не нужно.
+SITE_URL = "https://sibprof24.ru"
+CONSUMER_KEY = "ck_ВСТАВЬТЕ_СЮДА"
+CONSUMER_SECRET = "cs_ВСТАВЬТЕ_СЮДА"
 
 YML_URL = "https://yml.grmeh.ru/export/feed_yandex_yml23_.xml"
 
 SUPPLIER_MARKUP = 1.55   # наценка поставщика уже внутри их цены (+55%)
 OUR_MARKUP = 1.30        # наша наценка сверх себестоимости (+30%)
 
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+DRY_RUN = True
 BATCH_SIZE = 20
 DELAY_BETWEEN_BATCHES = 1.0
 LOG_FILE = "price_update_log.csv"
@@ -90,14 +84,43 @@ def calc_new_price(supplier_price):
     return round(cost * OUR_MARKUP, 2)
 
 
+MAX_RETRIES = 3
+RETRY_DELAY = 5  # секунд между повторными попытками при сетевом сбое
+
+
+def _request_with_retry(method, url, **kwargs):
+    """Делает запрос с несколькими попытками — на случай разового сетевого
+    сбоя (например, GitHub Actions на секунду теряет связь с сайтом)."""
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = requests.request(method, url, timeout=kwargs.pop("timeout", 30), **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                print(f"    Сетевой сбой (попытка {attempt}/{MAX_RETRIES}), повтор через {RETRY_DELAY} сек: {e}")
+                time.sleep(RETRY_DELAY)
+    # все попытки исчерпаны — пробрасываем последнюю ошибку выше,
+    # вызывающий код сам решит, пропустить товар или нет
+    raise last_error
+
+
 def get_product_id_by_sku(sku):
-    """Находит ID товара в WooCommerce по артикулу."""
+    """Находит ID товара в WooCommerce по артикулу. Возвращает None,
+    если товар не найден ИЛИ если после нескольких попыток так и не
+    удалось связаться с сайтом (сетевой сбой) — в обоих случаях
+    вызывающий код просто пропустит этот товар и пойдёт дальше."""
     url = f"{SITE_URL}/wp-json/wc/v3/products"
-    resp = requests.get(
-        url, params={"sku": sku},
-        auth=(CONSUMER_KEY, CONSUMER_SECRET), timeout=30
-    )
-    resp.raise_for_status()
+    try:
+        resp = _request_with_retry(
+            "GET", url, params={"sku": sku},
+            auth=(CONSUMER_KEY, CONSUMER_SECRET)
+        )
+    except requests.exceptions.RequestException as e:
+        print(f"    Не удалось получить ID для SKU {sku} после {MAX_RETRIES} попыток: {e}")
+        return None
     data = resp.json()
     if data:
         return data[0]["id"]
@@ -107,11 +130,10 @@ def get_product_id_by_sku(sku):
 def update_prices_batch(updates):
     """updates: список {'id': ..., 'regular_price': '...'}"""
     url = f"{SITE_URL}/wp-json/wc/v3/products/batch"
-    resp = requests.post(
-        url, json={"update": updates},
+    resp = _request_with_retry(
+        "POST", url, json={"update": updates},
         auth=(CONSUMER_KEY, CONSUMER_SECRET), timeout=60
     )
-    resp.raise_for_status()
     return resp.json()
 
 
