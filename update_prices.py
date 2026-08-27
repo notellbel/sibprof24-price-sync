@@ -9,44 +9,42 @@
    (1.55 = убираем их наценку 55%, 1.3 = добавляем нашу наценку 30%).
 4. Обновляет цену в WooCommerce по артикулу (SKU) через REST API.
 
-ПЕРЕД ПЕРВЫМ ЗАПУСКОМ:
-1. pip install requests
-2. Заполните SITE_URL, CONSUMER_KEY, CONSUMER_SECRET ниже
-   (те же ключи, что использовали для очистки дублей, права должны быть
-   "Чтение/Запись")
-3. Файл site_price_map.csv должен лежать рядом с этим скриптом.
-4. Сначала запустите с DRY_RUN = True — покажет, что изменится, ничего
-   не тронет. Проверьте цифры, потом поставьте DRY_RUN = False.
+ЗАПУСК ЧЕРЕЗ GITHUB ACTIONS:
+   Ключи (SITE_URL, CONSUMER_KEY, CONSUMER_SECRET) и режим DRY_RUN
+   приходят автоматически из GitHub Secrets и из файла
+   .github/workflows/update-prices.yml — этот файл трогать не нужно.
 
-КАК ЗАПУСКАТЬ РЕГУЛЯРНО (раз в 2-4 часа):
-Через Планировщик заданий Windows:
-  - Открыть "Планировщик заданий" -> "Создать простую задачу"
-  - Триггер: Ежедневно, повторять задачу каждые 2 часа в течение дня
-  - Действие: Запуск программы -> program: python.exe,
-    аргументы: полный путь до этого файла (update_prices.py),
-    рабочая папка: папка, где лежат оба файла
+ЗАПУСК ЛОКАЛЬНО НА СВОЁМ КОМПЬЮТЕРЕ (не обязательно, просто для проверки):
+   Впишите значения прямо в кавычки ниже вместо "ck_ВСТАВЬТЕ_СЮДА" и т.п.,
+   и поставьте DRY_RUN = True или False напрямую (замените всю строку
+   на DRY_RUN = True, без os.environ).
 """
 
+import os
 import csv
 import time
 import requests
 import xml.etree.ElementTree as ET
 
-# ========== НАСТРОЙКИ — ЗАПОЛНИТЕ ПЕРЕД ЗАПУСКОМ ==========
-SITE_URL = "https://sibprof24.ru"
-CONSUMER_KEY = "ck_ВСТАВЬТЕ_СЮДА"
-CONSUMER_SECRET = "cs_ВСТАВЬТЕ_СЮДА"
+# ========== НАСТРОЙКИ ==========
+SITE_URL = os.environ.get("WC_SITE_URL", "https://sibprof24.ru")
+CONSUMER_KEY = os.environ.get("WC_CONSUMER_KEY", "ck_ВСТАВЬТЕ_СЮДА")
+CONSUMER_SECRET = os.environ.get("WC_CONSUMER_SECRET", "cs_ВСТАВЬТЕ_СЮДА")
+# ^ если запускаете локально на своём компьютере - можно просто вписать
+#   ключи в кавычки выше вместо переменных окружения, тогда эта строка
+#   их и подхватит. Если запускаете через GitHub Actions - ключи придут
+#   из GitHub Secrets автоматически, ничего в этом файле менять не нужно.
 
 YML_URL = "https://yml.grmeh.ru/export/feed_yandex_yml23_.xml"
 
 SUPPLIER_MARKUP = 1.55   # наценка поставщика уже внутри их цены (+55%)
 OUR_MARKUP = 1.30        # наша наценка сверх себестоимости (+30%)
 
-DRY_RUN = True
+DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 BATCH_SIZE = 20
 DELAY_BETWEEN_BATCHES = 1.0
 LOG_FILE = "price_update_log.csv"
-# ============================================================
+# ================================
 
 
 def load_price_map(path="site_price_map.csv"):
@@ -102,16 +100,13 @@ def _request_with_retry(method, url, **kwargs):
             if attempt < MAX_RETRIES:
                 print(f"    Сетевой сбой (попытка {attempt}/{MAX_RETRIES}), повтор через {RETRY_DELAY} сек: {e}")
                 time.sleep(RETRY_DELAY)
-    # все попытки исчерпаны — пробрасываем последнюю ошибку выше,
-    # вызывающий код сам решит, пропустить товар или нет
     raise last_error
 
 
 def get_product_id_by_sku(sku):
     """Находит ID товара в WooCommerce по артикулу. Возвращает None,
     если товар не найден ИЛИ если после нескольких попыток так и не
-    удалось связаться с сайтом (сетевой сбой) — в обоих случаях
-    вызывающий код просто пропустит этот товар и пойдёт дальше."""
+    удалось связаться с сайтом (сетевой сбой)."""
     url = f"{SITE_URL}/wp-json/wc/v3/products"
     try:
         resp = _request_with_retry(
@@ -145,7 +140,6 @@ def main():
     print(f"Цен получено от поставщика: {len(supplier_prices)}")
 
     to_update = []
-    log_rows = []
     missing_in_feed = 0
 
     for item in mapping:
@@ -170,8 +164,8 @@ def main():
         print("\nЧтобы применить реально, поставьте DRY_RUN = False.")
         return
 
-    # ---- реальное обновление ----
     updated, errors = 0, 0
+    log_rows = []
     for i in range(0, len(to_update), BATCH_SIZE):
         chunk = to_update[i:i + BATCH_SIZE]
         batch_payload = []
@@ -179,7 +173,7 @@ def main():
             pid = get_product_id_by_sku(item["sku"])
             if pid is None:
                 errors += 1
-                log_rows.append([item["sku"], item["name"], "", item["new_price"], "SKU не найден на сайте"])
+                log_rows.append([item["sku"], item["name"], "", item["new_price"], "SKU не найден на сайте / сетевой сбой"])
                 continue
             batch_payload.append({"id": pid, "regular_price": str(item["new_price"])})
             log_rows.append([item["sku"], item["name"], pid, item["new_price"], "ok"])
