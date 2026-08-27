@@ -33,3 +33,16 @@ jobs:
           git add price_feed.csv
           git diff --quiet --cached || git commit -m "Обновление цен: $(date -u +'%Y-%m-%d %H:%M UTC')"
           git push
+
+      - name: Запустить импорт на сайте (Trigger)
+        run: |
+          curl -sS -o /dev/null -w "Trigger: HTTP %{http_code}\n" \
+            "https://sibprof24.ru/wp-load.php?import_key=DFR3mTGU&import_id=77&action=trigger" || true
+
+      - name: Подождать, пока сайт подготовится к обработке
+        run: sleep 10
+
+      - name: Выполнить импорт на сайте (Processing)
+        run: |
+          curl -sS -o /dev/null -w "Processing: HTTP %{http_code}\n" \
+            "https://sibprof24.ru/wp-load.php?import_key=DFR3mTGU&import_id=77&action=processing" || true
