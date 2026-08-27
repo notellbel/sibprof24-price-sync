@@ -1,50 +1,37 @@
 """
-Автообновление цен на sibprof24.ru по выгрузке поставщика (grmeh.ru).
+Подготовка файла с ценами для sibprof24.ru (гибридная схема).
+
+ПОЧЕМУ ТАК:
+Прямые запросы от GitHub Actions к WooCommerce API сайта стали
+блокироваться (похоже на защиту хостинга от чужих ботов). Поэтому
+вместо того чтобы GitHub стучался к сайту, этот скрипт готовит
+маленький файл с результатом и публикует его в самом репозитории.
+Дальше сайт сам, по расписанию, скачивает этот файл через
+WP All Import Pro (уже установлен на сайте) и обновляет цены —
+это исходящий запрос с сервера сайта, а не входящий, блокировку
+не затрагивает.
 
 ЧТО ДЕЛАЕТ:
-1. Скачивает свежий YML-файл поставщика (обновляется у них раз в 2 часа).
-2. Берёт готовую таблицу соответствия "наш артикул -> код товара поставщика"
-   (site_price_map.csv, уже проверена вручную на 113 товарах).
-3. Для каждого товара считает новую цену: (цена поставщика / 1.55) * 1.3
-   (1.55 = убираем их наценку 55%, 1.3 = добавляем нашу наценку 30%).
-4. Обновляет цену в WooCommerce по артикулу (SKU) через REST API.
-
-ЗАПУСК ЧЕРЕЗ GITHUB ACTIONS:
-   Ключи (SITE_URL, CONSUMER_KEY, CONSUMER_SECRET) и режим DRY_RUN
-   приходят автоматически из GitHub Secrets и из файла
-   .github/workflows/update-prices.yml — этот файл трогать не нужно.
-
-ЗАПУСК ЛОКАЛЬНО НА СВОЁМ КОМПЬЮТЕРЕ (не обязательно, просто для проверки):
-   Впишите значения прямо в кавычки ниже вместо "ck_ВСТАВЬТЕ_СЮДА" и т.п.,
-   и поставьте DRY_RUN = True или False напрямую (замените всю строку
-   на DRY_RUN = True, без os.environ).
+1. Скачивает свежий YML поставщика.
+2. Берёт таблицу соответствия site_price_map.csv (113 проверенных
+   товаров).
+3. Считает новую цену: (цена поставщика / 1.55) * 1.3
+4. Записывает результат в price_feed.csv — два столбца: sku;price
+   Этот файл коммитится в репозиторий самим workflow (см.
+   update-prices.yml) и становится доступен по прямой ссылке
+   через raw.githubusercontent.com — именно её вы укажете в
+   WP All Import.
 """
 
-import os
 import csv
-import time
-import requests
 import xml.etree.ElementTree as ET
-
-# ========== НАСТРОЙКИ ==========
-SITE_URL = os.environ.get("WC_SITE_URL", "https://sibprof24.ru")
-CONSUMER_KEY = os.environ.get("WC_CONSUMER_KEY", "ck_ВСТАВЬТЕ_СЮДА")
-CONSUMER_SECRET = os.environ.get("WC_CONSUMER_SECRET", "cs_ВСТАВЬТЕ_СЮДА")
-# ^ если запускаете локально на своём компьютере - можно просто вписать
-#   ключи в кавычки выше вместо переменных окружения, тогда эта строка
-#   их и подхватит. Если запускаете через GitHub Actions - ключи придут
-#   из GitHub Secrets автоматически, ничего в этом файле менять не нужно.
 
 YML_URL = "https://yml.grmeh.ru/export/feed_yandex_yml23_.xml"
 
 SUPPLIER_MARKUP = 1.55   # наценка поставщика уже внутри их цены (+55%)
 OUR_MARKUP = 1.30        # наша наценка сверх себестоимости (+30%)
 
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
-BATCH_SIZE = 20
-DELAY_BETWEEN_BATCHES = 1.0
-LOG_FILE = "price_update_log.csv"
-# ================================
+OUTPUT_FILE = "price_feed.csv"
 
 
 def load_price_map(path="site_price_map.csv"):
@@ -61,7 +48,7 @@ def load_price_map(path="site_price_map.csv"):
 
 
 def fetch_supplier_prices():
-    """Скачивает YML поставщика и возвращает {vendorCode: price}."""
+    import requests
     resp = requests.get(YML_URL, timeout=60)
     resp.raise_for_status()
     root = ET.fromstring(resp.content)
@@ -82,56 +69,6 @@ def calc_new_price(supplier_price):
     return round(cost * OUR_MARKUP, 2)
 
 
-MAX_RETRIES = 3
-RETRY_DELAY = 5  # секунд между повторными попытками при сетевом сбое
-
-
-def _request_with_retry(method, url, **kwargs):
-    """Делает запрос с несколькими попытками — на случай разового сетевого
-    сбоя (например, GitHub Actions на секунду теряет связь с сайтом)."""
-    last_error = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = requests.request(method, url, timeout=kwargs.pop("timeout", 30), **kwargs)
-            resp.raise_for_status()
-            return resp
-        except requests.exceptions.RequestException as e:
-            last_error = e
-            if attempt < MAX_RETRIES:
-                print(f"    Сетевой сбой (попытка {attempt}/{MAX_RETRIES}), повтор через {RETRY_DELAY} сек: {e}")
-                time.sleep(RETRY_DELAY)
-    raise last_error
-
-
-def get_product_id_by_sku(sku):
-    """Находит ID товара в WooCommerce по артикулу. Возвращает None,
-    если товар не найден ИЛИ если после нескольких попыток так и не
-    удалось связаться с сайтом (сетевой сбой)."""
-    url = f"{SITE_URL}/wp-json/wc/v3/products"
-    try:
-        resp = _request_with_retry(
-            "GET", url, params={"sku": sku},
-            auth=(CONSUMER_KEY, CONSUMER_SECRET)
-        )
-    except requests.exceptions.RequestException as e:
-        print(f"    Не удалось получить ID для SKU {sku} после {MAX_RETRIES} попыток: {e}")
-        return None
-    data = resp.json()
-    if data:
-        return data[0]["id"]
-    return None
-
-
-def update_prices_batch(updates):
-    """updates: список {'id': ..., 'regular_price': '...'}"""
-    url = f"{SITE_URL}/wp-json/wc/v3/products/batch"
-    resp = _request_with_retry(
-        "POST", url, json={"update": updates},
-        auth=(CONSUMER_KEY, CONSUMER_SECRET), timeout=60
-    )
-    return resp.json()
-
-
 def main():
     mapping = load_price_map()
     print(f"Товаров в таблице соответствия: {len(mapping)}")
@@ -139,65 +76,25 @@ def main():
     supplier_prices = fetch_supplier_prices()
     print(f"Цен получено от поставщика: {len(supplier_prices)}")
 
-    to_update = []
-    missing_in_feed = 0
-
+    rows = []
+    missing = 0
     for item in mapping:
         sp = supplier_prices.get(item["vendor_code"])
         if sp is None:
-            missing_in_feed += 1
+            missing += 1
             continue
-        new_price = calc_new_price(sp)
-        to_update.append({"sku": item["sku"], "new_price": new_price,
-                           "name": item["name"], "supplier_price": sp})
+        rows.append((item["sku"], calc_new_price(sp)))
 
-    print(f"Будет обновлено цен: {len(to_update)}")
-    print(f"Не найдено в текущей выгрузке поставщика (пропущено): {missing_in_feed}")
+    print(f"Товаров с ценой в итоговом файле: {len(rows)}")
+    print(f"Не найдено в текущей выгрузке поставщика (пропущено): {missing}")
 
-    if DRY_RUN:
-        print("\n=== СУХОЙ ПРОГОН (DRY_RUN=True), ничего не изменено ===")
-        for item in to_update[:10]:
-            print(f"  {item['sku']:20s} | {item['name'][:45]:45s} | "
-                  f"поставщик {item['supplier_price']:>10.2f} -> новая цена {item['new_price']:>10.2f}")
-        if len(to_update) > 10:
-            print(f"  ... и ещё {len(to_update) - 10} товаров")
-        print("\nЧтобы применить реально, поставьте DRY_RUN = False.")
-        return
-
-    updated, errors = 0, 0
-    log_rows = []
-    for i in range(0, len(to_update), BATCH_SIZE):
-        chunk = to_update[i:i + BATCH_SIZE]
-        batch_payload = []
-        for item in chunk:
-            pid = get_product_id_by_sku(item["sku"])
-            if pid is None:
-                errors += 1
-                log_rows.append([item["sku"], item["name"], "", item["new_price"], "SKU не найден на сайте / сетевой сбой"])
-                continue
-            batch_payload.append({"id": pid, "regular_price": str(item["new_price"])})
-            log_rows.append([item["sku"], item["name"], pid, item["new_price"], "ok"])
-
-        if batch_payload:
-            try:
-                update_prices_batch(batch_payload)
-                updated += len(batch_payload)
-                print(f"Обновлена пачка {i // BATCH_SIZE + 1}: {len(batch_payload)} товаров")
-            except requests.exceptions.RequestException as e:
-                errors += len(batch_payload)
-                print(f"ОШИБКА в пачке {i // BATCH_SIZE + 1}: {e}")
-
-        time.sleep(DELAY_BETWEEN_BATCHES)
-
-    with open(LOG_FILE, "w", newline="", encoding="utf-8-sig") as f:
+    with open(OUTPUT_FILE, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["sku", "name", "product_id", "new_price", "status"])
-        w.writerows(log_rows)
+        w.writerow(["sku", "price"])
+        for sku, price in rows:
+            w.writerow([sku, price])
 
-    print("\n=== ИТОГ ===")
-    print(f"Обновлено успешно: {updated}")
-    print(f"Ошибок / не найдено на сайте: {errors}")
-    print(f"Подробный лог: {LOG_FILE}")
+    print(f"Готово: {OUTPUT_FILE} записан, {len(rows)} строк.")
 
 
 if __name__ == "__main__":
